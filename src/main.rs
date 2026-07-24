@@ -745,7 +745,8 @@ impl State {
                 if g.version % 60 == 0 {
                     eprintln!("render: consuming frame #{}", g.version);
                 }
-                pane.last_version = g.version;
+                let ver = g.version;
+                pane.last_version = ver;
                 match g.gpu_index {
                     Some(gi) => {
                         pane.gpu_current = Some(gi);
@@ -754,17 +755,17 @@ impl State {
                     }
                     None => {
                         pane.gpu_current = None;
-                        Some((g.width, g.height, g.data.clone()))
+                        Some((ver, g.width, g.height, g.data.clone()))
                     }
                 }
             } else {
                 None
             }
         };
-        if let Some((w, h, data)) = frame {
-            // DIAGNOSTIC: dump first frame as BMP to verify capture content
-            if !DUMP_DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                dump_bmp(&data, w, h);
+        if let Some((v, w, h, data)) = frame {
+            // DIAGNOSTIC: dump a BMP every 120 frames
+            if v % 120 == 0 {
+                dump_bmp(&data, w, h, v);
             }
             if (w, h) != pane.tex_size {
                 pane.desktop_texture = create_desktop_texture(device, w, h);
@@ -1384,15 +1385,14 @@ fn build_tray(monitor_labels: &[String], current_monitor: usize, pinned: bool) -
 }
 
 // --------------- diagnostic frame dump ---------------
-static DUMP_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn dump_bmp(data: &[u8], w: u32, h: u32) {
+fn dump_bmp(data: &[u8], w: u32, h: u32, version: u64) {
     use std::io::Write;
     let path = std::env::current_exe()
         .unwrap_or_default()
         .parent()
         .unwrap_or(std::path::Path::new("."))
-        .join("capture_dump.bmp");
+        .join(format!("capture_dump_{version}.bmp"));
     let mut f = match std::fs::File::create(&path) {
         Ok(f) => f,
         Err(e) => { eprintln!("dump: cannot create {}: {e}", path.display()); return; }
