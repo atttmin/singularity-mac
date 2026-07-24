@@ -73,7 +73,7 @@ enum DuplicationError {
 fn create_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceContext), String> {
     let mut device: Option<ID3D11Device> = None;
     let mut ctx: Option<ID3D11DeviceContext> = None;
-    let flags = D3D11_CREATE_DEVICE_FLAG::default();
+    let flags = D3D11_CREATE_DEVICE_FLAG(0x20); // D3D11_CREATE_DEVICE_BGRA_SUPPORT
     unsafe {
         // windows 0.62: D3D11CreateDevice takes 9 args (sdkversion is implicit)
         D3D11CreateDevice(
