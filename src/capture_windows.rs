@@ -227,7 +227,7 @@ fn run(
         monitor,
         cursor,
         border,
-        SecondaryWindowSettings::Default,
+        SecondaryWindowSettings::Include,
         MinimumUpdateIntervalSettings::Default,
         DirtyRegionSettings::Default,
         ColorFormat::Bgra8,
