@@ -762,6 +762,10 @@ impl State {
             }
         };
         if let Some((w, h, data)) = frame {
+            // DIAGNOSTIC: dump first frame as BMP to verify capture content
+            if !DUMP_DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                dump_bmp(&data, w, h);
+            }
             if (w, h) != pane.tex_size {
                 pane.desktop_texture = create_desktop_texture(device, w, h);
                 pane.bind_group = make_bind_group(
@@ -1377,6 +1381,44 @@ fn build_tray(monitor_labels: &[String], current_monitor: usize, pinned: bool) -
         open_cfg_id: open_cfg.id().clone(),
         quit_id: quit.id().clone(),
     }
+}
+
+// --------------- diagnostic frame dump ---------------
+static DUMP_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn dump_bmp(data: &[u8], w: u32, h: u32) {
+    use std::io::Write;
+    let path = std::env::current_exe()
+        .unwrap_or_default()
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("capture_dump.bmp");
+    let mut f = match std::fs::File::create(&path) {
+        Ok(f) => f,
+        Err(e) => { eprintln!("dump: cannot create {}: {e}", path.display()); return; }
+    };
+    let row_size = ((w * 4) + 3) & !3;
+    let px_size = (row_size * h) as u32;
+    let file_size = 14 + 40 + px_size;
+    // BMP file header
+    let _ = f.write_all(b"BM");
+    let _ = f.write_all(&file_size.to_le_bytes());
+    let _ = f.write_all(&[0u8; 4]); // reserved
+    let _ = f.write_all(&(54u32).to_le_bytes()); // data offset
+    // DIB header (BITMAPINFOHEADER)
+    let _ = f.write_all(&(40u32).to_le_bytes()); // header size
+    let _ = f.write_all(&(w as i32).to_le_bytes());
+    let _ = f.write_all(&(-(h as i32)).to_le_bytes()); // negative = top-down
+    let _ = f.write_all(&(1u16).to_le_bytes()); // planes
+    let _ = f.write_all(&(32u16).to_le_bytes()); // bpp
+    let _ = f.write_all(&[0u8; 24]); // rest of DIB
+    // pixel data (BGRA -> BMP expects BGRA, so direct copy)
+    for y in 0..h as usize {
+        let row = &data[y * (w as usize * 4)..(y + 1) * (w as usize * 4)];
+        let _ = f.write_all(row);
+        // BMP rows are padded to 4 bytes, but w*4 is already 4-byte aligned for BGRA8
+    }
+    eprintln!("dump: wrote {} ({}x{})", path.display(), w, h);
 }
 
 fn main() {
