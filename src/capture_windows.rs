@@ -261,37 +261,16 @@ pub fn start(shared: Shared, monitor_index: usize) {
         if idx == usize::MAX {
             return; // pane torn down
         }
-        let attempts: [(CursorCaptureSettings, DrawBorderSettings, &str); 3] = [
-            (
-                CursorCaptureSettings::WithoutCursor,
-                DrawBorderSettings::WithoutBorder,
-                "cursor excluded, no border",
-            ),
-            (
-                CursorCaptureSettings::WithoutCursor,
-                DrawBorderSettings::Default,
-                "cursor excluded, default border",
-            ),
-            (
-                CursorCaptureSettings::Default,
-                DrawBorderSettings::Default,
-                "default settings",
-            ),
-        ];
-        let mut ran = false;
-        for (cursor, border, label) in attempts {
-            eprintln!("capture: starting monitor {} ({label})", idx + 1);
-            match run(idx, cursor, border, shared.clone()) {
-                Ok(()) => {
-                    ran = true;
-                    break;
-                }
-                Err(e) => eprintln!("capture: {label} failed: {e}"),
+        // Single attempt with full defaults: the cascading fallback logic
+        // (WithoutCursor / WithoutBorder) may interfere with window-layer
+        // capture on certain Windows builds.
+        eprintln!("capture: starting monitor {} (default settings)", idx + 1);
+        match run(idx, CursorCaptureSettings::Default, DrawBorderSettings::Default, shared.clone()) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("capture: failed: {e}");
+                return;
             }
-        }
-        if !ran {
-            eprintln!("capture: all attempts failed");
-            return;
         }
         // if the target monitor is unchanged, the session ended for real
         if shared.lock().unwrap().monitor_index == idx {
