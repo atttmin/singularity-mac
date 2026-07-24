@@ -95,7 +95,7 @@ impl GraphicsCaptureApiHandler for Handler {
             scratch: Vec::new(),
             got_first: false,
             gpu: None,
-            gpu_failed: false,
+            gpu_failed: true, // force CPU path: GPU shared-texture sync is unreliable across D3D11/D3D12
             monitor_index: ctx.flags.1,
         })
     }
