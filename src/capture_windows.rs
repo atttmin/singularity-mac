@@ -259,7 +259,7 @@ fn acquire_frame(
             SampleDesc: desc.SampleDesc,
             Usage: D3D11_USAGE_STAGING,
             BindFlags: D3D11_BIND_FLAG::default(),
-            CPUAccessFlags: D3D11_CPU_ACCESS_FLAG(0x10000), // D3D11_CPU_ACCESS_READ
+            CPUAccessFlags: D3D11_CPU_ACCESS_FLAG(0x20000), // D3D11_CPU_ACCESS_READ
             MiscFlags: D3D11_RESOURCE_MISC_FLAG::default(),
         };
 
