@@ -1,0 +1,70 @@
+[package]
+name = "singularity"
+version = "0.3.0"
+edition = "2021"
+description = "A drifting black hole gravitational lens over your desktop"
+license = "MIT"
+repository = "https://github.com/GreenScreen410/singularity"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+# Versions pinned to a known-good wgpu 23 / winit 0.29 combo.
+# If cargo resolves something incompatible and the build breaks, send me the
+# errors, pin the exact versions from Cargo.lock.
+[dependencies]
+winit = "0.29"
+wgpu = "23"
+pollster = "0.3"
+bytemuck = { version = "1", features = ["derive"] }
+env_logger = "0.11"
+log = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+windows-capture = "2"
+raw-window-handle = "0.6"
+tray-icon = "0.19"
+# zero-copy capture path: D3D11 (capture) -> shared textures -> D3D12 (wgpu).
+# windows must match windows-capture's version so the COM types line up.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Direct3D",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+] }
+# wgpu-hal 23 speaks windows 0.58; only used to hand resources across the
+# hal boundary (same COM ABI, bridged by raw pointer)
+windows_058 = { package = "windows", version = "0.58", features = [
+    "Win32_Graphics_Direct3D12",
+] }
+
+# macOS support is structurally complete but UNTESTED - no Mac in the dev
+# loop. It is kept type-checked via `cargo check --target aarch64-apple-darwin`
+# (the objc2 binding crates are pure Rust declarations, so they type-check on
+# any host; only the final link needs a Mac).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-core-media = "0.3"
+objc2-core-video = "0.3"
+objc2-screen-capture-kit = "0.3"
+block2 = "0.6"
+dispatch2 = "0.3"
+raw-window-handle = "0.6"
+tray-icon = "0.19"
+
+[dev-dependencies]
+naga = { version = "23", features = ["wgsl-in"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
