@@ -6,15 +6,17 @@
 use crate::Shared;
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
-    D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION,
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Resource,
+    ID3D11Texture2D, D3D11_BIND_FLAG, D3D11_CPU_ACCESS_FLAG, D3D11_MAP_READ,
+    D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, D3D11_CREATE_DEVICE_FLAG,
 };
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory1, IDXGIOutput, IDXGIOutput1,
-    IDXGIOutputDuplication, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT,
-    DXGI_OUTDUPL_DESC,
+    IDXGIAdapter, IDXGIDevice, IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication,
+    IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_DESC,
 };
-use std::ptr::null;
+use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+use windows::Win32::Foundation::HMODULE;
 
 /// Spawn a background thread that captures the selected monitor using the
 /// DXGI Desktop Duplication API (driver-level, captures everything including
@@ -34,7 +36,6 @@ pub fn start(shared: Shared, monitor_index: usize) {
 
         eprintln!("capture: initializing DXGI Desktop Duplication for monitor {}", monitor_index + 1);
 
-        // Create D3D11 device
         let (device, ctx) = match create_d3d11_device() {
             Ok(v) => v,
             Err(e) => {
@@ -51,7 +52,6 @@ pub fn start(shared: Shared, monitor_index: usize) {
                 }
                 Err(DuplicationError::AccessLost) => {
                     eprintln!("capture: DXGI access lost, restarting...");
-                    // Resolution change or mode switch; reset state and retry
                     let mut g = shared.lock().unwrap();
                     g.width = 0;
                     g.height = 0;
@@ -76,18 +76,18 @@ enum DuplicationError {
 fn create_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceContext), String> {
     let mut device: Option<ID3D11Device> = None;
     let mut ctx: Option<ID3D11DeviceContext> = None;
-    let flags = D3D11_CREATE_DEVICE_FLAG(0); // no debug flag
+    let flags = D3D11_CREATE_DEVICE_FLAG::default();
     unsafe {
         D3D11CreateDevice(
-            None, // default adapter
-            windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE,
-            None, // no software rasterizer
+            None,              // default adapter
+            D3D_DRIVER_TYPE_HARDWARE,
+            HMODULE::default(), // no software rasterizer
             flags,
-            None, // default feature level
+            None,              // default feature levels
             0,
             D3D11_SDK_VERSION,
             Some(&mut device),
-            None, // feature level out
+            None,              // feature level out
             Some(&mut ctx),
         )
     }
@@ -102,21 +102,18 @@ fn dxgi_capture_loop(
     ctx: &ID3D11DeviceContext,
     shared: &Shared,
 ) -> Result<(), DuplicationError> {
-    // Get the DXGI output for the target monitor
     let idx = shared.lock().unwrap().monitor_index;
-    let (dup, desc) = create_duplication(device, idx)?;
+    let dup = create_duplication(device, idx)?;
 
-    let mut scratch: Vec<u8> = Vec::new();
     let mut first = true;
     let mut consecutive_timeouts: u32 = 0;
 
     loop {
-        // Check for monitor switch
         if shared.lock().unwrap().monitor_index != idx {
             return Ok(());
         }
 
-        match acquire_frame(&dup, device, ctx, &mut scratch) {
+        match acquire_frame(&dup, device, ctx) {
             Ok(Some((w, h, data))) => {
                 consecutive_timeouts = 0;
                 if first {
@@ -125,7 +122,6 @@ fn dxgi_capture_loop(
                 }
                 let mut g = shared.lock().unwrap();
                 let v = g.version;
-                // diagnostic: log every 60 frames
                 if v % 60 == 0 {
                     eprintln!("capture: frame #{v} ({w}x{h})");
                 }
@@ -136,10 +132,8 @@ fn dxgi_capture_loop(
                 g.version = v.wrapping_add(1);
             }
             Ok(None) => {
-                // No new frame (timeout); briefly yield CPU
                 consecutive_timeouts += 1;
                 if consecutive_timeouts > 300 {
-                    // ~30s with no frames; screen might be static, that's fine
                     consecutive_timeouts = 0;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
@@ -153,9 +147,8 @@ fn dxgi_capture_loop(
 fn create_duplication(
     device: &ID3D11Device,
     monitor_index: usize,
-) -> Result<(IDXGIOutputDuplication, DXGI_OUTDUPL_DESC), DuplicationError> {
+) -> Result<IDXGIOutputDuplication, DuplicationError> {
     unsafe {
-        // Get the DXGI device from D3D11 device
         let dxgi_device: IDXGIDevice = device.cast().map_err(|e| {
             DuplicationError::Fatal(format!("failed to cast to IDXGIDevice: {e}"))
         })?;
@@ -163,7 +156,6 @@ fn create_duplication(
             DuplicationError::Fatal(format!("GetAdapter failed: {e}"))
         })?;
 
-        // Enumerate outputs
         let mut output_idx = 0u32;
         let mut target_output: Option<IDXGIOutput> = None;
         let mut found = 0usize;
@@ -210,8 +202,7 @@ fn create_duplication(
             DuplicationError::Fatal(format!("DuplicateOutput failed: {e}"))
         })?;
 
-        let dup_desc = dup.GetDesc();
-        Ok((dup, dup_desc))
+        Ok(dup)
     }
 }
 
@@ -219,7 +210,6 @@ fn acquire_frame(
     dup: &IDXGIOutputDuplication,
     device: &ID3D11Device,
     ctx: &ID3D11DeviceContext,
-    scratch: &mut Vec<u8>,
 ) -> Result<Option<(u32, u32, Vec<u8>)>, DuplicationError> {
     unsafe {
         let mut frame_info = std::mem::zeroed();
@@ -252,19 +242,26 @@ fn acquire_frame(
             DuplicationError::Fatal(format!("failed to cast frame to ID3D11Texture2D: {e}"))
         })?;
 
-        let desc = std::mem::zeroed();
-        texture.GetDesc(&mut std::mem::transmute(&desc));
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        texture.GetDesc(&mut desc);
 
         let width = desc.Width;
         let height = desc.Height;
-        let expected_len = (width as usize) * (height as usize) * 4;
+        let tight_pitch = (width as usize) * 4;
 
-        // Create staging texture if size changed
-        let mut staging_desc = desc;
-        staging_desc.Usage = D3D11_USAGE_STAGING;
-        staging_desc.BindFlags = 0;
-        staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        staging_desc.MiscFlags = 0;
+        // Create staging texture for CPU readback
+        let staging_desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: desc.Format,
+            SampleDesc: desc.SampleDesc,
+            Usage: D3D11_USAGE_STAGING,
+            BindFlags: D3D11_BIND_FLAG::default(),
+            CPUAccessFlags: D3D11_CPU_ACCESS_FLAG(0x10000), // D3D11_CPU_ACCESS_READ
+            MiscFlags: D3D11_RESOURCE_MISC_FLAG::default(),
+        };
 
         let mut staging: Option<ID3D11Texture2D> = None;
         device
@@ -276,41 +273,29 @@ fn acquire_frame(
 
         ctx.CopyResource(&staging, &texture);
 
-        let mapped = ctx.Map(
-            &staging,
-            0,
-            D3D11_MAP_READ,
-            0, // no map flags
-        );
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        ctx.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+        .map_err(|e| {
+            let _ = dup.ReleaseFrame();
+            DuplicationError::Fatal(format!("Map failed: {e:?}"))
+        })?;
 
-        match mapped {
-            Ok(mapped) => {
-                let row_pitch = mapped.RowPitch as usize;
-                let data_ptr = mapped.pData as *const u8;
+        let row_pitch = mapped.RowPitch as usize;
+        let data_ptr = mapped.pData as *const u8;
 
-                let tight_pitch = (width as usize) * 4;
-                if scratch.len() != tight_pitch * (height as usize) {
-                    *scratch = vec![0u8; tight_pitch * (height as usize)];
-                }
+        let mut out = vec![0u8; tight_pitch * (height as usize)];
 
-                // Copy row by row, handling stride
-                for y in 0..height as usize {
-                    let src_row = std::slice::from_raw_parts(
-                        data_ptr.add(y * row_pitch),
-                        tight_pitch,
-                    );
-                    scratch[y * tight_pitch..(y + 1) * tight_pitch].copy_from_slice(src_row);
-                }
-
-                ctx.Unmap(&staging, 0);
-                let _ = dup.ReleaseFrame();
-
-                Ok(Some((width, height, scratch.clone())))
-            }
-            Err(e) => {
-                let _ = dup.ReleaseFrame();
-                Err(DuplicationError::Fatal(format!("Map failed: {e:?}")))
-            }
+        for y in 0..height as usize {
+            let src = std::slice::from_raw_parts(
+                data_ptr.add(y * row_pitch),
+                tight_pitch,
+            );
+            out[y * tight_pitch..(y + 1) * tight_pitch].copy_from_slice(src);
         }
+
+        ctx.Unmap(&staging, 0);
+        let _ = dup.ReleaseFrame();
+
+        Ok(Some((width, height, out)))
     }
 }
