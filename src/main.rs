@@ -767,17 +767,17 @@ impl State {
             if v % 120 == 0 {
                 dump_bmp(&data, w, h, v);
             }
-            // Always recreate texture+bind_group to rule out wgpu texture
-            // reuse / staleness issues on write_texture->sample pipeline.
-            pane.desktop_texture = create_desktop_texture(device, w, h);
-            pane.bind_group = make_bind_group(
-                device,
-                layout,
-                &pane.uniform_buf,
-                &pane.desktop_texture,
-                sampler,
-            );
-            pane.tex_size = (w, h);
+            if (w, h) != pane.tex_size {
+                pane.desktop_texture = create_desktop_texture(device, w, h);
+                pane.bind_group = make_bind_group(
+                    device,
+                    layout,
+                    &pane.uniform_buf,
+                    &pane.desktop_texture,
+                    sampler,
+                );
+                pane.tex_size = (w, h);
+            }
             queue.write_texture(
                 wgpu::ImageCopyTexture {
                     texture: &pane.desktop_texture,

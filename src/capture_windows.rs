@@ -228,8 +228,8 @@ fn run(
         cursor,
         border,
         SecondaryWindowSettings::Default,
-        MinimumUpdateIntervalSettings::Default,
-        DirtyRegionSettings::Default,
+        MinimumUpdateIntervalSettings::Manual(std::time::Duration::from_millis(1)),
+        DirtyRegionSettings::ReportOnly,
         ColorFormat::Bgra8,
         (shared, monitor_index),
     );
