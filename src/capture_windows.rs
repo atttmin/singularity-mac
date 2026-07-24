@@ -246,7 +246,7 @@ pub fn start(shared: Shared, monitor_index: usize) {
             g.data = Vec::new();
             g.gpu_index = None;
             g.gpu_handles = None;
-            g.gpu_disabled = false;
+            g.gpu_disabled = true; // force CPU path; GPU shared-texture cross-API sync unreliable
             g.epoch = g.epoch.wrapping_add(1);
             g.monitor_index
         };
