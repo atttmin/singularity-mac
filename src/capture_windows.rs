@@ -1,287 +1,302 @@
-// Windows desktop capture via DXGI Desktop Duplication API.
-// Direct driver-level capture that bypasses the Windows.Graphics.Capture
-// WinRT abstraction, which has known bugs with window-layer visibility on
-// certain Windows builds (e.g. Win10 22H2 + RTX 4060).
+// Windows desktop capture via Windows.Graphics.Capture (windows-capture crate).
+// Runs on its own thread. Preferred path: GPU-copy each frame into a shared
+// D3D12 texture (zero CPU round trip); falls back to CPU readback if the
+// render side could not set up sharing (non-DX12 backend, mismatched adapter,
+// old drivers).
 
-use crate::Shared;
+use crate::{Shared, GPU_BUFFERS};
 use windows::core::Interface;
+use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
-    ID3D11Texture2D, D3D11_MAP_READ,
-    D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION,
-    D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
-    D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+    ID3D11Device1, ID3D11Device5, ID3D11DeviceContext4, ID3D11Fence, ID3D11Texture2D,
+    D3D11_FENCE_FLAG_NONE,
 };
-use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, IDXGIAdapter, IDXGIDevice, IDXGIFactory1,
-    IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication,
-    IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT,
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+use windows_capture::{
+    capture::{Context, GraphicsCaptureApiHandler},
+    frame::Frame,
+    graphics_capture_api::InternalCaptureControl,
+    monitor::Monitor,
+    settings::{
+        ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
+        MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
+    },
 };
-use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
-use windows::Win32::Foundation::HMODULE;
 
-pub fn start(shared: Shared, monitor_index: usize) {
-    std::thread::spawn(move || {
-        let mut g = shared.lock().unwrap();
-        g.width = 0;
-        g.height = 0;
-        g.data = Vec::new();
-        g.gpu_index = None;
-        g.gpu_handles = None;
-        g.gpu_disabled = true;
-        g.epoch = g.epoch.wrapping_add(1);
-        g.monitor_index = monitor_index;
-        drop(g);
-
-        eprintln!("capture: initializing DXGI Desktop Duplication for monitor {}", monitor_index + 1);
-
-        let (device, ctx) = match create_d3d11_device() {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("capture: D3D11 device creation failed: {e}");
-                return;
-            }
-        };
-
-        loop {
-            match dxgi_capture_loop(&device, &ctx, &shared) {
-                Ok(()) => {
-                    eprintln!("capture: session ended normally");
-                    return;
-                }
-                Err(DuplicationError::AccessLost) => {
-                    eprintln!("capture: DXGI access lost, restarting...");
-                    let mut g = shared.lock().unwrap();
-                    g.width = 0;
-                    g.height = 0;
-                    g.data = Vec::new();
-                    g.epoch = g.epoch.wrapping_add(1);
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                }
-                Err(DuplicationError::Fatal(msg)) => {
-                    eprintln!("capture: fatal error: {msg}");
-                    return;
-                }
-            }
-        }
-    });
+/// D3D11 side of the zero-copy path: the shared textures opened from the
+/// render side's NT handles, plus a fence so we only publish a buffer index
+/// after the GPU actually finished the copy.
+struct GpuPath {
+    textures: Vec<ID3D11Texture2D>,
+    ctx4: ID3D11DeviceContext4,
+    fence: ID3D11Fence,
+    event: isize, // raw HANDLE value; HANDLE itself is not Send
+    fence_value: u64,
+    next: usize,
+    size: (u32, u32),
 }
 
-enum DuplicationError {
-    AccessLost,
-    Fatal(String),
+fn open_gpu_path(frame: &Frame, handles: [isize; GPU_BUFFERS], size: (u32, u32)) -> Result<GpuPath, String> {
+    let device = frame.device();
+    let device1: ID3D11Device1 = device.cast().map_err(|e| format!("no ID3D11Device1: {e}"))?;
+    let mut textures = Vec::with_capacity(GPU_BUFFERS);
+    for h in handles {
+        let tex: ID3D11Texture2D = unsafe { device1.OpenSharedResource1(HANDLE(h as *mut _)) }
+            .map_err(|e| format!("OpenSharedResource1: {e}"))?;
+        textures.push(tex);
+    }
+    let device5: ID3D11Device5 = device.cast().map_err(|e| format!("no ID3D11Device5: {e}"))?;
+    let mut fence: Option<ID3D11Fence> = None;
+    unsafe { device5.CreateFence(0, D3D11_FENCE_FLAG_NONE, &mut fence) }
+        .map_err(|e| format!("CreateFence: {e}"))?;
+    let fence = fence.ok_or("CreateFence returned nothing")?;
+    let ctx4: ID3D11DeviceContext4 = frame
+        .device_context()
+        .cast()
+        .map_err(|e| format!("no ID3D11DeviceContext4: {e}"))?;
+    let event =
+        unsafe { CreateEventW(None, false, false, None) }.map_err(|e| format!("CreateEventW: {e}"))?;
+    Ok(GpuPath {
+        textures,
+        ctx4,
+        fence,
+        event: event.0 as isize,
+        fence_value: 0,
+        next: 0,
+        size,
+    })
 }
 
-fn create_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceContext), String> {
-    unsafe {
-        let factory: IDXGIFactory1 = CreateDXGIFactory1().map_err(|e| format!("CreateDXGIFactory1: {e}"))?;
-        let adapter: IDXGIAdapter = factory.EnumAdapters1(0).map_err(|e| format!("EnumAdapters1(0): {e}"))?.into();
+struct Handler {
+    shared: Shared,
+    scratch: Vec<u8>,
+    got_first: bool,
+    gpu: Option<GpuPath>,
+    gpu_failed: bool,
+    monitor_index: usize, // which monitor this session captures
+}
 
-        let mut device: Option<ID3D11Device> = None;
-
-        D3D11CreateDevice(
-            Some(&adapter),
-            D3D_DRIVER_TYPE_UNKNOWN,
-            HMODULE::default(),
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-            None,
-            D3D11_SDK_VERSION,
-            Some(&mut device),
-            None,
-            None,
-        )
-        .map_err(|e| format!("D3D11CreateDevice: {e}"))?;
-
-        let device = device.ok_or("null device")?;
-        let ctx: ID3D11DeviceContext = device.GetImmediateContext()
-            .map_err(|e| format!("GetImmediateContext: {e}"))?;
-        eprintln!("capture: D3D11 device created successfully");
-        Ok((device, ctx))
+impl Handler {
+    fn disable_gpu(&mut self, why: &str) {
+        eprintln!("capture: GPU sharing unavailable ({why}); using CPU path");
+        self.gpu = None;
+        self.gpu_failed = true;
+        self.shared.lock().unwrap().gpu_disabled = true;
     }
 }
 
-fn dxgi_capture_loop(
-    device: &ID3D11Device,
-    ctx: &ID3D11DeviceContext,
-    shared: &Shared,
-) -> Result<(), DuplicationError> {
-    let idx = shared.lock().unwrap().monitor_index;
-    let dup = create_duplication(device, idx)?;
+impl GraphicsCaptureApiHandler for Handler {
+    type Flags = (Shared, usize);
+    type Error = Box<dyn std::error::Error + Send + Sync>;
 
-    let mut first = true;
-
-    loop {
-        if shared.lock().unwrap().monitor_index != idx {
-            return Ok(());
-        }
-
-        match acquire_frame(&dup, device, ctx) {
-            Ok(Some((w, h, data))) => {
-                if first {
-                    eprintln!("capture: first frame arrived via DXGI ({w}x{h})");
-                    first = false;
-                }
-                let mut g = shared.lock().unwrap();
-                let v = g.version;
-                if v.wrapping_rem(60) == 0 {
-                    eprintln!("capture: frame #{v} ({w}x{h})");
-                }
-                g.data = data;
-                g.width = w;
-                g.height = h;
-                g.gpu_index = None;
-                g.version = v.wrapping_add(1);
-            }
-            Ok(None) => {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            Err(DuplicationError::AccessLost) => return Err(DuplicationError::AccessLost),
-            Err(e) => return Err(e),
-        }
-    }
-}
-
-fn create_duplication(
-    device: &ID3D11Device,
-    monitor_index: usize,
-) -> Result<IDXGIOutputDuplication, DuplicationError> {
-    unsafe {
-        let dxgi_device: IDXGIDevice = device.cast().map_err(|e| {
-            DuplicationError::Fatal(format!("cast to IDXGIDevice: {e}"))
-        })?;
-        let adapter: IDXGIAdapter = dxgi_device.GetAdapter().map_err(|e| {
-            DuplicationError::Fatal(format!("GetAdapter: {e}"))
-        })?;
-
-        let mut output_idx = 0u32;
-        let mut target_output: Option<IDXGIOutput> = None;
-        let mut found = 0usize;
-        loop {
-            match adapter.EnumOutputs(output_idx) {
-                Ok(o) => {
-                    if found == monitor_index {
-                        target_output = Some(o);
-                        break;
-                    }
-                    found += 1;
-                    output_idx += 1;
-                }
-                Err(_) => break,
-            }
-        }
-
-        let output = target_output.ok_or_else(|| {
-            DuplicationError::Fatal(format!(
-                "monitor {} not found ({} outputs)",
-                monitor_index + 1, found
-            ))
-        })?;
-
-        let output1: IDXGIOutput1 = output.cast().map_err(|e| {
-            DuplicationError::Fatal(format!("cast to IDXGIOutput1: {e}"))
-        })?;
-
-        let desc = output1.GetDesc().map_err(|e| {
-            DuplicationError::Fatal(format!("GetDesc: {e}"))
-        })?;
-
-        eprintln!(
-            "capture: monitor {} = {} ({}x{})",
-            monitor_index + 1,
-            String::from_utf16_lossy(&desc.DeviceName),
-            desc.DesktopCoordinates.right - desc.DesktopCoordinates.left,
-            desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top,
-        );
-
-        output1.DuplicateOutput(device).map_err(|e| {
-            DuplicationError::Fatal(format!("DuplicateOutput: {e}"))
+    fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
+        Ok(Self {
+            shared: ctx.flags.0,
+            scratch: Vec::new(),
+            got_first: false,
+            gpu: None,
+            gpu_failed: true, // force CPU path: GPU shared-texture sync is unreliable across D3D11/D3D12
+            monitor_index: ctx.flags.1,
         })
     }
+
+    fn on_frame_arrived(
+        &mut self,
+        frame: &mut Frame,
+        capture_control: InternalCaptureControl,
+    ) -> Result<(), Self::Error> {
+        // a monitor switch was requested: end this session so the outer loop
+        // can start a new one on the right monitor
+        if self.shared.lock().unwrap().monitor_index != self.monitor_index {
+            capture_control.stop();
+            return Ok(());
+        }
+        let width = frame.width();
+        let height = frame.height();
+        if !self.got_first {
+            eprintln!("capture: first frame arrived ({width}x{height})");
+            self.got_first = true;
+        }
+        // diagnostic: log every 60th frame to confirm capture is delivering
+        {
+            let v = self.shared.lock().unwrap().version;
+            if v % 60 == 0 {
+                eprintln!("capture: frame #{v} ({width}x{height})");
+            }
+        }
+
+        // ---- zero-copy path ----
+        if !self.gpu_failed {
+            if self.gpu.is_none() {
+                // the render side publishes NT handles once it has created
+                // the shared textures (sized from our first CPU frames)
+                let handles = {
+                    let g = self.shared.lock().unwrap();
+                    if g.gpu_disabled {
+                        self.gpu_failed = true;
+                        None
+                    } else if g.gpu_size == (width, height) {
+                        g.gpu_handles
+                    } else {
+                        None
+                    }
+                };
+                if let Some(h) = handles {
+                    match open_gpu_path(frame, h, (width, height)) {
+                        Ok(gp) => {
+                            eprintln!("capture: zero-copy GPU path active");
+                            self.gpu = Some(gp);
+                        }
+                        Err(e) => self.disable_gpu(&e),
+                    }
+                }
+            }
+            if let Some(gp) = &mut self.gpu {
+                if gp.size != (width, height) {
+                    // monitor resolution changed; shared textures are stale
+                    self.disable_gpu("capture size changed");
+                } else {
+                    let i = gp.next;
+                    gp.next = (i + 1) % GPU_BUFFERS;
+                    unsafe {
+                        frame
+                            .device_context()
+                            .CopyResource(&gp.textures[i], frame.as_raw_texture());
+                        // wait for the copy before publishing, so the D3D12
+                        // side never samples a half-written frame
+                        gp.fence_value += 1;
+                        let v = gp.fence_value;
+                        let event = HANDLE(gp.event as *mut _);
+                        if gp.ctx4.Signal(&gp.fence, v).is_ok() {
+                            if gp.fence.GetCompletedValue() < v
+                                && gp.fence.SetEventOnCompletion(v, event).is_ok()
+                            {
+                                WaitForSingleObject(event, 100);
+                            }
+                        } else {
+                            frame.device_context().Flush();
+                        }
+                    }
+                    let mut g = self.shared.lock().unwrap();
+                    if !g.data.is_empty() {
+                        g.data = Vec::new(); // CPU staging no longer needed
+                    }
+                    g.width = width;
+                    g.height = height;
+                    g.gpu_index = Some(i);
+                    g.version = g.version.wrapping_add(1);
+                    return Ok(());
+                }
+            }
+        }
+
+        // ---- CPU fallback path ----
+        let buffer = frame.buffer()?;
+        // Depad rows into our reusable scratch buffer -> tight width*4 stride.
+        let bytes = buffer.as_nopadding_buffer(&mut self.scratch);
+
+        let mut g = self.shared.lock().unwrap();
+        if g.data.len() != bytes.len() {
+            g.data.resize(bytes.len(), 0);
+        }
+        g.data.copy_from_slice(bytes);
+        g.width = width;
+        g.height = height;
+        g.gpu_index = None;
+        g.version = g.version.wrapping_add(1);
+        Ok(())
+    }
+
+    fn on_closed(&mut self) -> Result<(), Self::Error> {
+        eprintln!("capture: session closed");
+        Ok(())
+    }
 }
 
-fn acquire_frame(
-    dup: &IDXGIOutputDuplication,
-    device: &ID3D11Device,
-    ctx: &ID3D11DeviceContext,
-) -> Result<Option<(u32, u32, Vec<u8>)>, DuplicationError> {
-    unsafe {
-        let mut frame_info = std::mem::zeroed();
-        let mut resource: Option<IDXGIResource> = None;
+fn run(
+    monitor_index: usize,
+    cursor: CursorCaptureSettings,
+    border: DrawBorderSettings,
+    shared: Shared,
+) -> Result<(), String> {
+    // windows-capture indices are 1-based; fall back to the primary monitor
+    let monitor = Monitor::from_index(monitor_index + 1)
+        .or_else(|_| Monitor::primary())
+        .map_err(|e| format!("no monitor: {e:?}"))?;
+    let settings = Settings::new(
+        monitor,
+        cursor,
+        border,
+        SecondaryWindowSettings::Default,
+        MinimumUpdateIntervalSettings::Default,
+        DirtyRegionSettings::Default,
+        ColorFormat::Bgra8,
+        (shared, monitor_index),
+    );
+    // Blocking: runs the capture message loop on this thread until closed.
+    Handler::start(settings).map_err(|e| format!("{e:?}"))
+}
 
-        match dup.AcquireNextFrame(100, &mut frame_info, &mut resource) {
-            Ok(()) => {}
-            Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(None),
-            Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => return Err(DuplicationError::AccessLost),
-            Err(e) => {
-                return Err(DuplicationError::Fatal(format!(
-                    "AcquireNextFrame: {e:?}"
-                )));
+/// Spawn a background thread that captures the selected monitor forever,
+/// restarting the session whenever shared.monitor_index changes.
+/// Preferred: cursor excluded (the real cursor is OS-drawn on top of the
+/// overlay, so a captured copy would ghost near the hole) and no yellow
+/// capture-indicator border. Both toggles are unsupported on some older
+/// Windows 10 builds, so fall back progressively if starting fails.
+pub fn start(shared: Shared, monitor_index: usize) {
+    std::thread::spawn(move || loop {
+        let idx = {
+            // fresh session: reset frame + GPU-sharing negotiation state
+            let mut g = shared.lock().unwrap();
+            g.width = 0;
+            g.height = 0;
+            g.data = Vec::new();
+            g.gpu_index = None;
+            g.gpu_handles = None;
+            g.gpu_disabled = true; // force CPU path; GPU shared-texture cross-API sync unreliable
+            g.epoch = g.epoch.wrapping_add(1);
+            g.monitor_index
+        };
+        let _ = monitor_index; // fixed per pane; shared carries the live value
+        if idx == usize::MAX {
+            return; // pane torn down
+        }
+        let attempts: [(CursorCaptureSettings, DrawBorderSettings, &str); 3] = [
+            (
+                CursorCaptureSettings::WithoutCursor,
+                DrawBorderSettings::WithoutBorder,
+                "cursor excluded, no border",
+            ),
+            (
+                CursorCaptureSettings::WithoutCursor,
+                DrawBorderSettings::Default,
+                "cursor excluded, default border",
+            ),
+            (
+                CursorCaptureSettings::Default,
+                DrawBorderSettings::Default,
+                "default settings",
+            ),
+        ];
+        let mut ran = false;
+        for (cursor, border, label) in attempts {
+            eprintln!("capture: starting monitor {} ({label})", idx + 1);
+            match run(idx, cursor, border, shared.clone()) {
+                Ok(()) => {
+                    ran = true;
+                    break;
+                }
+                Err(e) => eprintln!("capture: {label} failed: {e}"),
             }
         }
-
-        let resource = match resource {
-            Some(r) => r,
-            None => {
-                let _ = dup.ReleaseFrame();
-                return Ok(None);
-            }
-        };
-
-        let texture: ID3D11Texture2D = resource.cast().map_err(|e| {
-            DuplicationError::Fatal(format!("cast to Texture2D: {e}"))
-        })?;
-
-        let mut desc = D3D11_TEXTURE2D_DESC::default();
-        texture.GetDesc(&mut desc);
-
-        let width = desc.Width;
-        let height = desc.Height;
-        let tight_pitch = (width as usize) * 4;
-
-        let staging_desc = D3D11_TEXTURE2D_DESC {
-            Width: width,
-            Height: height,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: desc.Format,
-            SampleDesc: desc.SampleDesc,
-            Usage: D3D11_USAGE_STAGING,
-            BindFlags: 0,
-            CPUAccessFlags: 0x20000,
-            MiscFlags: 0,
-        };
-
-        let mut staging: Option<ID3D11Texture2D> = None;
-        device.CreateTexture2D(&staging_desc, None, Some(&mut staging))
-            .map_err(|e| {
-                DuplicationError::Fatal(format!("CreateTexture2D: {e}"))
-            })?;
-        let staging = staging.unwrap();
-
-        ctx.CopyResource(&staging, &texture);
-
-        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        ctx.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
-            .map_err(|e| {
-                let _ = dup.ReleaseFrame();
-                DuplicationError::Fatal(format!("Map: {e:?}"))
-            })?;
-
-        let row_pitch = mapped.RowPitch as usize;
-        let data_ptr = mapped.pData as *const u8;
-
-        let mut out = vec![0u8; tight_pitch * (height as usize)];
-        for y in 0..height as usize {
-            let src = std::slice::from_raw_parts(
-                data_ptr.add(y * row_pitch),
-                tight_pitch,
-            );
-            out[y * tight_pitch..(y + 1) * tight_pitch].copy_from_slice(src);
+        if !ran {
+            eprintln!("capture: all attempts failed");
+            return;
         }
-
-        ctx.Unmap(&staging, 0);
-        let _ = dup.ReleaseFrame();
-
-        Ok(Some((width, height, out)))
-    }
+        // if the target monitor is unchanged, the session ended for real
+        if shared.lock().unwrap().monitor_index == idx {
+            eprintln!("capture: session ended");
+            return;
+        }
+    });
 }
