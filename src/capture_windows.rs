@@ -8,14 +8,15 @@ use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
     ID3D11Texture2D, D3D11_MAP_READ,
-    D3D11_MAPPED_SUBRESOURCE,
+    D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION,
     D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, D3D11_CREATE_DEVICE_FLAG,
 };
 use windows::Win32::Graphics::Dxgi::{
-    IDXGIAdapter, IDXGIDevice, IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication,
+    CreateDXGIFactory1, IDXGIAdapter, IDXGIDevice, IDXGIFactory1,
+    IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication,
     IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT,
 };
-use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Foundation::HMODULE;
 
 pub fn start(shared: Shared, monitor_index: usize) {
@@ -36,7 +37,7 @@ pub fn start(shared: Shared, monitor_index: usize) {
         let (device, ctx) = match create_d3d11_device() {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("capture: D3D11CreateDevice failed: {e}");
+                eprintln!("capture: D3D11 device creation failed: {e}");
                 return;
             }
         };
@@ -71,27 +72,36 @@ enum DuplicationError {
 }
 
 fn create_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceContext), String> {
-    let mut device: Option<ID3D11Device> = None;
-    let mut ctx: Option<ID3D11DeviceContext> = None;
-    let flags = D3D11_CREATE_DEVICE_FLAG(0x20); // D3D11_CREATE_DEVICE_BGRA_SUPPORT
+    // Use DXGI factory to get the hardware adapter, then create a D3D11
+    // device explicitly bound to it. This is more reliable than passing
+    // None for the adapter (which has had API-surface issues in the
+    // windows 0.62 crate).
     unsafe {
-        // windows 0.62: D3D11CreateDevice takes 9 args (sdkversion is implicit)
+        let factory: IDXGIFactory1 = CreateDXGIFactory1().map_err(|e| format!("CreateDXGIFactory1: {e}"))?;
+        let adapter: IDXGIAdapter = factory.EnumAdapters1(0).map_err(|e| format!("EnumAdapters1(0): {e}"))?;
+
+        let mut device: Option<ID3D11Device> = None;
+        let mut ctx: Option<ID3D11DeviceContext> = None;
+
         D3D11CreateDevice(
-            None,
-            D3D_DRIVER_TYPE_HARDWARE,
-            HMODULE::default(),
-            flags,
+            Some(&adapter),
+            D3D_DRIVER_TYPE_UNKNOWN,
+            HMODULE(0),
+            D3D11_CREATE_DEVICE_FLAG(0x20), // BGRA_SUPPORT
             None,
             0,
+            D3D11_SDK_VERSION,
             Some(&mut device),
             None,
             Some(&mut ctx),
         )
+        .map_err(|e| format!("D3D11CreateDevice: {e}"))?;
+
+        let device = device.ok_or("null device")?;
+        let ctx = ctx.ok_or("null context")?;
+        eprintln!("capture: D3D11 device created successfully");
+        Ok((device, ctx))
     }
-    .map_err(|e| format!("{e:?}"))?;
-    let device = device.ok_or("D3D11CreateDevice returned null device")?;
-    let ctx = ctx.ok_or("D3D11CreateDevice returned null context")?;
-    Ok((device, ctx))
 }
 
 fn dxgi_capture_loop(
@@ -103,7 +113,6 @@ fn dxgi_capture_loop(
     let dup = create_duplication(device, idx)?;
 
     let mut first = true;
-    let mut consecutive_timeouts: u32 = 0;
 
     loop {
         if shared.lock().unwrap().monitor_index != idx {
@@ -112,7 +121,6 @@ fn dxgi_capture_loop(
 
         match acquire_frame(&dup, device, ctx) {
             Ok(Some((w, h, data))) => {
-                consecutive_timeouts = 0;
                 if first {
                     eprintln!("capture: first frame arrived via DXGI ({w}x{h})");
                     first = false;
@@ -129,10 +137,6 @@ fn dxgi_capture_loop(
                 g.version = v.wrapping_add(1);
             }
             Ok(None) => {
-                consecutive_timeouts += 1;
-                if consecutive_timeouts > 300 {
-                    consecutive_timeouts = 0;
-                }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             Err(DuplicationError::AccessLost) => return Err(DuplicationError::AccessLost),
@@ -238,7 +242,6 @@ fn acquire_frame(
         let height = desc.Height;
         let tight_pitch = (width as usize) * 4;
 
-        // Staging texture for CPU readback
         let staging_desc = D3D11_TEXTURE2D_DESC {
             Width: width,
             Height: height,
@@ -248,7 +251,7 @@ fn acquire_frame(
             SampleDesc: desc.SampleDesc,
             Usage: D3D11_USAGE_STAGING,
             BindFlags: 0,
-            CPUAccessFlags: 0x20000, // D3D11_CPU_ACCESS_READ
+            CPUAccessFlags: 0x20000,
             MiscFlags: 0,
         };
 
