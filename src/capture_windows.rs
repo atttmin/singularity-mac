@@ -8,7 +8,7 @@ use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
     ID3D11Texture2D, D3D11_MAP_READ,
-    D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION,
+    D3D11_MAPPED_SUBRESOURCE,
     D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, D3D11_CREATE_DEVICE_FLAG,
 };
 use windows::Win32::Graphics::Dxgi::{
@@ -73,24 +73,22 @@ enum DuplicationError {
 
 fn create_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceContext), String> {
     // Use DXGI factory to get the hardware adapter, then create a D3D11
-    // device explicitly bound to it. This is more reliable than passing
-    // None for the adapter (which has had API-surface issues in the
-    // windows 0.62 crate).
+    // device explicitly bound to it.
     unsafe {
         let factory: IDXGIFactory1 = CreateDXGIFactory1().map_err(|e| format!("CreateDXGIFactory1: {e}"))?;
-        let adapter: IDXGIAdapter = factory.EnumAdapters1(0).map_err(|e| format!("EnumAdapters1(0): {e}"))?;
+        let adapter: IDXGIAdapter = factory.EnumAdapters1(0).map_err(|e| format!("EnumAdapters1(0): {e}"))?.into();
 
         let mut device: Option<ID3D11Device> = None;
         let mut ctx: Option<ID3D11DeviceContext> = None;
 
+        // windows 0.62: 9-arg signature (sdkversion is implicit)
         D3D11CreateDevice(
             Some(&adapter),
             D3D_DRIVER_TYPE_UNKNOWN,
-            HMODULE(0),
+            HMODULE(std::ptr::null_mut()),
             D3D11_CREATE_DEVICE_FLAG(0x20), // BGRA_SUPPORT
             None,
             0,
-            D3D11_SDK_VERSION,
             Some(&mut device),
             None,
             Some(&mut ctx),
