@@ -742,6 +742,9 @@ impl State {
         let frame = {
             let g = pane.shared.lock().unwrap();
             if g.version != pane.last_version && g.width > 0 && g.height > 0 {
+                if g.version % 60 == 0 {
+                    eprintln!("render: consuming frame #{}", g.version);
+                }
                 pane.last_version = g.version;
                 match g.gpu_index {
                     Some(gi) => {

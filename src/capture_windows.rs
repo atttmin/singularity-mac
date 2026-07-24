@@ -117,6 +117,13 @@ impl GraphicsCaptureApiHandler for Handler {
             eprintln!("capture: first frame arrived ({width}x{height})");
             self.got_first = true;
         }
+        // diagnostic: log every 60th frame to confirm capture is delivering
+        {
+            let v = self.shared.lock().unwrap().version;
+            if v % 60 == 0 {
+                eprintln!("capture: frame #{v} ({width}x{height})");
+            }
+        }
 
         // ---- zero-copy path ----
         if !self.gpu_failed {
