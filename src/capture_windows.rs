@@ -19,8 +19,7 @@ use windows_capture::{
     monitor::Monitor,
     settings::{
         ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
-        GraphicsCaptureDirtyRegionMode, MinimumUpdateIntervalSettings,
-        SecondaryWindowSettings, Settings,
+        MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
     },
 };
 
@@ -230,7 +229,7 @@ fn run(
         border,
         SecondaryWindowSettings::Default,
         MinimumUpdateIntervalSettings::Custom(std::time::Duration::from_millis(1)),
-        DirtyRegionSettings::Custom(GraphicsCaptureDirtyRegionMode::ReportOnly),
+        DirtyRegionSettings::Default,
         ColorFormat::Bgra8,
         (shared, monitor_index),
     );
